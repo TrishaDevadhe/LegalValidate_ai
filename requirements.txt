@@ -1,0 +1,10 @@
+streamlit
+langchain
+langgraph
+langchain-groq
+python-dotenv
+pdfplumber
+pypdfium2
+pytesseract
+tenacity
+pydantic

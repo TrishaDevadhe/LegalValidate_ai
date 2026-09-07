@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  legalvalidate-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: legalvalidate_ai_app
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    volumes:
+      # Persist SQLite results database across container restarts
+      - ./legalvalidate.db:/app/legalvalidate.db
+      # Persist vector storage data directory if local persistence is enabled
+      - ./data:/app/data
+    restart: unless-stopped
