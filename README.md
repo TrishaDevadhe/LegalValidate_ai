@@ -1,70 +1,108 @@
 # LegalValidate AI
 
-LegalValidate AI is an intelligent multi-agent legal document validation and risk assessment system powered by LangGraph, LangChain, and Groq LLMs. The platform classifies documents, analyzes document structure, detects contract risks with RAG-grounded retrieval intelligence, summarizes clauses in plain language, verifies risk severity via a Critic agent, and performs semantic clause comparisons between contract revisions.
-
-> 📖 **Technical Architecture & Portfolio Case Study**: For an in-depth breakdown of the multi-agent system design, DAG routing, RAG grounding, human-in-the-loop checkpoints, model selection evolution, and empirical benchmark evaluation, view [WRITEUP.md](WRITEUP.md).
-
+**LegalValidate AI** is a production-grade multi-agent legal document validation, risk intelligence, and redline comparison system powered by **LangGraph**, **LangChain**, and **Groq LLMs**. The platform classifies documents, analyzes contractual structure, detects grounded risks with RAG retrieval against standard baseline templates, verifies risk validity and severity via an independent Critic agent, provides plain-language explanations for non-lawyers, supports human-in-the-loop audit decisions, and performs semantic clause comparisons between contract revisions.
 
 ---
 
-## Model Selection & Architecture Rationale
+## 🏗️ Multi-Agent Architecture & LangGraph DAG
 
-During initial system development, unified default models like `llama-3.1-8b-instant` were evaluated across all agents. However, lightweight 8B models on Groq encountered strict `BadRequestError` exceptions (`tool calling is not supported with this model`) or generated incomplete JSON outputs when executing Pydantic structured output chains (`with_structured_output`).
+```
+                                  [Input Document]
+                                         │
+                                         ▼
+                               [Agent 1: Classifier]
+                                  (gpt-oss-20b)
+                                         │
+                        ┌────────────────┴────────────────┐
+                 [is_legal = False]                [is_legal = True]
+                        │                                 │
+                        ▼                                 ▼
+              [Non-Legal Explainer]             [Agent 2: Analyzer]
+                        │                          (gpt-oss-20b)
+                        │                                 │
+                        │                                 ▼
+                        │                      [Agent 3: Risk Detector]
+                        │                        (qwen3.8-27b + RAG)
+                        │                                 │
+                        │                                 ▼
+                        │                       [Agent 4: Critic Node]
+                        │                          (qwen3.8-27b)
+                        │                                 │
+                        │                                 ▼
+                        │                      [Agent 5: Explainer]
+                        │                          (gpt-oss-20b)
+                        │                                 │
+                        │                                 ▼
+                        │                    [Human-in-the-Loop Checkpoint]
+                        │                     (Accept / Reject / Note)
+                        │                                 │
+                        │                                 ▼
+                        │                     [Final Report Compiler]
+                        │                                 │
+                        └────────────────┬────────────────┘
+                                         ▼
+                                 [Final Dashboard]
+```
 
-To ensure reliable schema validation, tool execution, and high-precision reasoning, LegalValidate AI uses a **per-agent model configuration**:
+### Agent Roles & Model Configuration
+The system uses a **per-agent model configuration** (`config.py`):
 
-- **Reasoning & RAG Heavy Agents** (`risk_detector`, `critic`, `comparator`): Powered by `qwen/qwen3.8-27b` for deep legal reasoning, high-fidelity schema adherence, retrieval alignment, and objective verification.
-- **Fast Extraction & Classification Agents** (`legal_classifier`, `document_analyzer`, `explanation_agent`): Powered by `openai/gpt-oss-20b` for high-speed classification, document category extraction, and plain-language rephrasing with full structured tool calling support.
-
----
-
-## Agent Model Configuration
-
-Per-agent models are dynamically configured in `config.py` via `MODEL_CONFIG` and can be customized via environment variables:
-
-| Agent Name | Configured Model | Task Complexity / Rationale |
+| Agent Name | Configured Model | Complexity & Responsibility |
 | :--- | :--- | :--- |
-| `legal_classifier` | `openai/gpt-oss-20b` | High-speed binary legal vs non-legal classification |
-| `document_analyzer` | `openai/gpt-oss-20b` | Structured document category & key section extraction |
-| `risk_detector` | `qwen/qwen3.8-27b` | RAG-retrieval grounded risk assessment |
-| `critic` | `qwen/qwen3.8-27b` | Objective risk verification and severity grading |
-| `explanation_agent` | `openai/gpt-oss-20b` | Plain-language contract summarization |
-| `comparator` | `qwen/qwen3.8-27b` | Multi-document semantic clause comparison |
+| `legal_classifier` | `openai/gpt-oss-20b` | High-speed binary legal vs non-legal classification with confidence scoring |
+| `document_analyzer` | `openai/gpt-oss-20b` | Structured extraction of parties, effective dates, terms, payment, governing law, and missing safeguards |
+| `risk_detector` | `qwen/qwen3.8-27b` | RAG retrieval grounding against 25 standard legal clause templates; structured risk detection |
+| `critic` | `qwen/qwen3.8-27b` | Independent legal audit; filters false positives, justifies severity (CRITICAL, HIGH, MEDIUM, LOW) |
+| `explanation_agent` | `openai/gpt-oss-20b` | Jargon-free translations, business impact, and review action points for non-lawyers |
+| `comparator` | `qwen/qwen3.8-27b` | Semantic clause alignment between Version A and B, detecting ADDED, REMOVED, MODIFIED clauses and risk direction |
 
 ---
 
-## Local Setup & Installation
+## 🛡️ RAG Grounding & Zero-Hallucination Policy
 
-Follow these steps to set up and run LegalValidate AI on your local environment:
+1. **25 Gold-Standard Legal Reference Templates**: Built-in reference corpus across NDAs, Leases, Employment, SaaS SLAs, MSAs, IP Assignment, Indemnity, Liability Caps, and Compliance.
+2. **Deterministic Similarity Retrieval**: Vector search calculates cosine similarity against baseline standards.
+3. **Evidence Requirement**: Every detected risk cites verbatim contract evidence and links to a baseline reference standard.
+4. **No-Hallucination Guardrail**: If similarity is below the threshold, the system returns `"Insufficient retrieved evidence"` and does not invent statutes or citations.
 
-### 1. Clone the Repository
+---
+
+## 🧑‍⚖️ Human-in-the-Loop (HITL) Checkpoints
+
+After the Risk Detector and Critic verify findings, LangGraph pauses execution at an interactive breakpoint (`interrupt_before=["human_review"]`):
+- Reviewers inspect each flagged risk alongside Critic justifications.
+- Reviewers can **Accept Risk**, **Reject Finding**, or **Mark for Review**, and attach custom legal notes.
+- The system preserves original AI findings while recording the human decision trail and timestamp.
+
+---
+
+## 🚀 Quickstart & Local Setup
+
+### 1. Prerequisites
+- Python 3.10+ (or Docker)
+- Groq API Key ([https://console.groq.com](https://console.groq.com))
+
+### 2. Installation
 ```bash
 git clone https://github.com/your-username/legalvalidate_ai.git
 cd legalvalidate_ai
-```
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
 
-### 2. Environment Configuration
-Copy the example environment configuration to create your `.env` file:
-```bash
-cp .env.example .env
-```
-Open `.env` and set your Groq API key:
-```env
-GROQ_API_KEY=your_groq_api_key_here
-```
-
-### 3. Install Python Dependencies
-Ensure Python 3.10+ is installed, then install all required packages:
-```bash
 pip install -r requirements.txt
 ```
-*(Optional system OCR support: Install Tesseract OCR and Poppler if analyzing scanned PDF images).*
 
-### 4. Vector Store Seeding
-On initial run, `retriever.py` automatically initializes the standard legal clause reference vector store in memory using the built-in seed corpus (`STANDARD_CLAUSE_TEMPLATES`). No manual database seeding is required.
+### 3. Environment Configuration
+Create `.env` in the project root:
+```env
+GROQ_API_KEY=gsk_your_groq_api_key_here
+ENABLE_RETRIEVAL=true
+```
 
-### 5. Launch Streamlit Application
-Run the main Streamlit application:
+### 4. Run Streamlit Application
 ```bash
 streamlit run app.py
 ```
@@ -72,39 +110,30 @@ Open your browser at `http://localhost:8501`.
 
 ---
 
-## Run with Docker
-
-You can launch LegalValidate AI inside a containerized environment without installing Python, Tesseract OCR, or Poppler utilities locally.
-
-### Prerequisites
-1. Ensure Docker Desktop is installed and running.
-2. Create a `.env` file in the project root with your Groq API key:
-   ```env
-   GROQ_API_KEY=your_groq_api_key_here
-   ```
-
-### Command to Build & Start
-To build the container image and launch the application:
+## 🐳 Running with Docker
 
 ```bash
+# Build and run containerized application
 docker compose up --build
 ```
+Access the application at `http://localhost:8501`.
 
-Access the Streamlit web dashboard in your browser at:
-`http://localhost:8501`
+---
 
-### Stopping the Container
+## 🧪 Automated Testing & Evaluation
+
+### Run Integration Test Suite
 ```bash
-docker compose down
+python test_pipeline.py
+```
+
+### Run Benchmark Suite across 34 Labeled Test Cases
+```bash
+python evals/eval.py
 ```
 
 ---
 
-## Running Evaluations
+## ⚖️ Legal Safety Disclaimer
 
-To run the full multi-agent benchmark across 34 labeled documents:
-
-```bash
-python evals/eval.py
-```
-Results will be output as a summary table and exported to `evals/results_<timestamp>.json`.
+> **IMPORTANT:** LegalValidate AI is an automated machine-learning document analysis assistant. It does **NOT** provide legal advice, establish an attorney-client relationship, or replace review by a licensed attorney. Always consult qualified legal counsel before executing binding agreements.

@@ -1,137 +1,238 @@
+import io
+import re
+import os
+import zipfile
+import xml.etree.ElementTree as ET
+from typing import List, Dict, Any, Optional, Tuple
 import pdfplumber
 import pypdfium2 as pdfium
 import pytesseract
-import io
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
-def extract_text_from_pdf(file_bytes):
-    """Extracts text from a PDF file byte stream using pdfplumber, with OCR fallback."""
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    """
+    Extracts text from a .docx file using standard library zipfile and XML parsing.
+    Extracts body paragraphs and table contents cleanly.
+    """
     try:
-        text = ""
-        # 1. Try extracting text via pdfplumber
+        with io.BytesIO(file_bytes) as docx_file:
+            with zipfile.ZipFile(docx_file) as z:
+                xml_content = z.read("word/document.xml")
+        
+        tree = ET.fromstring(xml_content)
+        # XML namespace for wordprocessingml
+        namespaces = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+        
+        paragraphs = []
+        for p in tree.iterfind('.//w:p', namespaces):
+            texts = [node.text for node in p.iterfind('.//w:t', namespaces) if node.text]
+            if texts:
+                paragraphs.append("".join(texts))
+                
+        # Also extract table text if present
+        for t in tree.iterfind('.//w:tbl', namespaces):
+            for row in t.iterfind('.//w:tr', namespaces):
+                row_texts = []
+                for cell in row.iterfind('.//w:tc', namespaces):
+                    cell_texts = [node.text for node in cell.iterfind('.//w:t', namespaces) if node.text]
+                    if cell_texts:
+                        row_texts.append("".join(cell_texts))
+                if row_texts:
+                    paragraphs.append(" | ".join(row_texts))
+                    
+        return "\n\n".join(paragraphs).strip()
+    except Exception as e:
+        return f"Error extracting DOCX: {str(e)}"
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Extracts text from a PDF byte stream with page metadata and OCR fallback.
+    Returns:
+        tuple: (full_text, pages_metadata)
+        where pages_metadata is a list of dicts: [{'page': 1, 'text': '...'}]
+    """
+    pages_metadata = []
+    full_text_list = []
+    
+    try:
+        # 1. Native text extraction via pdfplumber
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
+            for idx, page in enumerate(pdf.pages, start=1):
+                page_text = page.extract_text() or ""
+                page_text = page_text.strip()
                 if page_text:
-                    text += page_text + "\n"
+                    pages_metadata.append({"page": idx, "text": page_text})
+                    full_text_list.append(f"--- [Page {idx}] ---\n{page_text}")
         
-        text = text.strip()
+        extracted_text = "\n\n".join(full_text_list).strip()
         
-        # 2. Check if extracted text is empty or near-empty (threshold: e.g. < 50 characters)
-        if len(text) < 50:
-            # Trigger OCR fallback
+        # 2. Check if text is suspiciously empty or scanned
+        if len(extracted_text) < 50:
             try:
                 doc = pdfium.PdfDocument(io.BytesIO(file_bytes))
-                ocr_text = ""
-                for page in doc:
-                    # Render page to bitmap at scale=2 for decent OCR accuracy
+                ocr_text_list = []
+                pages_metadata = []
+                
+                for idx, page in enumerate(doc, start=1):
+                    # Render page bitmap for OCR
                     bitmap = page.render(scale=2)
                     pil_img = bitmap.to_pil()
-                    ocr_text += pytesseract.image_to_string(pil_img) + "\n"
+                    page_ocr = pytesseract.image_to_string(pil_img).strip()
+                    if page_ocr:
+                        pages_metadata.append({"page": idx, "text": page_ocr})
+                        ocr_text_list.append(f"--- [Page {idx} (OCR)] ---\n{page_ocr}")
                 
-                ocr_text = ocr_text.strip()
-                if len(ocr_text) > 0:
-                    return ocr_text
+                ocr_full = "\n\n".join(ocr_text_list).strip()
+                if len(ocr_full) > 0:
+                    return ocr_full, pages_metadata
                 else:
-                    return "Warning: Extracted text is empty and OCR could not extract any text from the scanned document."
+                    return "Warning: Extracted text is empty. Document appears blank or unscannable.", []
             except Exception as ocr_err:
-                # If OCR fails due to missing dependencies (e.g. Tesseract not installed on Windows),
-                # return a helpful message instead of crashing.
-                return f"{text}\n\n[OCR Fallback attempted but failed: {str(ocr_err)}. Ensure Tesseract is installed and in your system PATH for scanned PDF support.]"
-        
-        return text
+                fallback_msg = extracted_text if extracted_text else "Document contains no readable text."
+                return f"{fallback_msg}\n\n[OCR Fallback attempted: {str(ocr_err)}. Note: Ensure Tesseract OCR is installed on your host system for scanned image PDFs.]", pages_metadata
+
+        return extracted_text, pages_metadata
     except Exception as e:
-        return f"Error extracting PDF: {str(e)}"
+        return f"Error extracting PDF: {str(e)}", []
 
-def clean_text(text):
-    """Basic text cleaning."""
-    return " ".join(text.split())
 
-def split_text_by_sections(text, max_chars=30000):
+def extract_document_text(file_bytes: bytes, filename: str) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    Splits text into logical sections based on headings or clause starts,
-    ensuring each chunk does not exceed max_chars unless a single section is larger.
+    Main document loader entry point supporting PDF, DOCX, and TXT files.
     """
-    import re
+    ext = filename.split('.')[-1].lower() if '.' in filename else ''
+    
+    if ext == 'pdf':
+        return extract_text_from_pdf(file_bytes)
+    elif ext in ['docx', 'doc']:
+        text = extract_text_from_docx(file_bytes)
+        return text, [{"page": 1, "text": text}]
+    else:
+        # Default text decode
+        try:
+            text = file_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            text = file_bytes.decode('latin-1', errors='ignore')
+        return text, [{"page": 1, "text": text}]
+
+
+def clean_text(text: str) -> str:
+    """Normalizes whitespace and standardizes common quotes/dashes."""
+    if not text:
+        return ""
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = re.sub(r'[\u2018\u2019]', "'", text)
+    text = re.sub(r'[\u201C\u201D]', '"', text)
+    text = re.sub(r'[\u2013\u2014]', '-', text)
+    # Remove repetitive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def split_text_by_sections(text: str, max_chars: int = 4000) -> List[str]:
+    """
+    Splits legal text into cohesive clauses and section chunks preserving clause boundaries.
+    """
+    if not text:
+        return []
     if len(text) <= max_chars:
         return [text]
 
-    # Pattern to detect headings, clauses, sections (e.g. Section 1, Clause A, ARTICLE II, 1.1, etc.)
-    heading_pattern = re.compile(
-        r'^(?:SECTION|CLAUSE|ARTICLE|SCHEDULE|EXHIBIT|\d+\.\d+|\d+\.)\b', 
-        re.IGNORECASE
+    # Detect legal section headers, numbered clauses, or article dividers
+    section_pattern = re.compile(
+        r'(?=(?:^(?:SECTION|CLAUSE|ARTICLE|SCHEDULE|EXHIBIT|\d+\.\d+|\d+\.)\b)|(?:\n\n[A-Z0-9\s]{3,40}:))',
+        re.IGNORECASE | re.MULTILINE
     )
 
-    lines = text.split('\n')
+    raw_sections = [s.strip() for s in section_pattern.split(text) if s and s.strip()]
+    if not raw_sections or len(raw_sections) <= 1:
+        # Fallback to paragraph splitting
+        raw_sections = [p.strip() for p in text.split('\n\n') if p.strip()]
+
     chunks = []
     current_chunk = []
     current_length = 0
 
-    for line in lines:
-        stripped = line.strip()
-        # If line starts a new section and we are already holding content
-        if heading_pattern.match(stripped) and current_chunk:
-            # Check if adding this section would exceed limit
-            if current_length >= max_chars:
-                chunks.append('\n'.join(current_chunk))
-                current_chunk = []
-                current_length = 0
-        
-        current_chunk.append(line)
-        current_length += len(line) + 1
+    for sec in raw_sections:
+        if current_length + len(sec) + 2 > max_chars and current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+            current_chunk = [sec]
+            current_length = len(sec)
+        else:
+            current_chunk.append(sec)
+            current_length += len(sec) + 2
 
     if current_chunk:
-        chunks.append('\n'.join(current_chunk))
+        chunks.append("\n\n".join(current_chunk))
 
-    # If any single chunk is still larger than max_chars, split it by paragraph/length
-    final_chunks = []
-    for chunk in chunks:
-        if len(chunk) <= max_chars:
-            final_chunks.append(chunk)
-        else:
-            # Split by paragraph
-            paragraphs = chunk.split('\n\n')
-            sub_chunk = []
-            sub_length = 0
-            for para in paragraphs:
-                if sub_length + len(para) > max_chars and sub_chunk:
-                    final_chunks.append('\n\n'.join(sub_chunk))
-                    sub_chunk = []
-                    sub_length = 0
-                sub_chunk.append(para)
-                sub_length += len(para) + 2
-            if sub_chunk:
-                final_chunks.append('\n\n'.join(sub_chunk))
+    return chunks
 
-    return final_chunks
+
+def split_text_into_chunks_with_metadata(text: str, doc_id: str = "doc_1", max_chars: int = 3000) -> List[Dict[str, Any]]:
+    """
+    Splits text into chunks annotated with metadata: page, section, document_id, chunk_id.
+    Ensures metadata survives the RAG and analysis pipeline.
+    """
+    sections = split_text_by_sections(text, max_chars=max_chars)
+    chunks = []
+    
+    # Try detecting page markers if present
+    current_page = 1
+    for idx, sec in enumerate(sections, start=1):
+        page_match = re.search(r'---\s*\[Page\s*(\d+)\]\s*---', sec)
+        if page_match:
+            try:
+                current_page = int(page_match.group(1))
+            except ValueError:
+                pass
+                
+        # Detect section title if first line resembles a heading
+        first_line = sec.split('\n')[0].strip()
+        section_name = first_line[:60] if len(first_line) < 80 else f"Section {idx}"
+        
+        chunks.append({
+            "chunk_id": f"{doc_id}_chunk_{idx}",
+            "document_id": doc_id,
+            "page": current_page,
+            "section": section_name,
+            "text": sec
+        })
+        
+    return chunks
+
 
 def generate_pdf_report(final_state: dict) -> bytes:
-    from io import BytesIO
-    from reportlab.lib.pagesizes import letter
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib import colors
-    
-    buffer = BytesIO()
+    """
+    Generates a professional multi-page PDF Audit Report for LegalValidate AI using ReportLab.
+    Includes: Executive Summary, Document Details, Risk Analysis, Critic Verifications,
+    Human Review Actions, and Legal Disclaimer.
+    """
+    buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
-        rightMargin=54,
-        leftMargin=54,
-        topMargin=54,
-        bottomMargin=54
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=40,
+        bottomMargin=40
     )
     
     styles = getSampleStyleSheet()
     
-    # Custom Styles
+    # Typography Styles
     title_style = ParagraphStyle(
         'DocTitle',
         parent=styles['Heading1'],
         fontName='Helvetica-Bold',
-        fontSize=24,
-        leading=28,
+        fontSize=22,
+        leading=26,
         textColor=colors.HexColor('#1E3A8A'),
-        spaceAfter=15
+        spaceAfter=4
     )
     
     subtitle_style = ParagraphStyle(
@@ -140,19 +241,19 @@ def generate_pdf_report(final_state: dict) -> bytes:
         fontName='Helvetica',
         fontSize=10,
         leading=14,
-        textColor=colors.HexColor('#4B5563'),
-        spaceAfter=25
+        textColor=colors.HexColor('#6B7280'),
+        spaceAfter=15
     )
     
     h1_style = ParagraphStyle(
         'SectionH1',
         parent=styles['Heading2'],
         fontName='Helvetica-Bold',
-        fontSize=16,
-        leading=20,
+        fontSize=14,
+        leading=18,
         textColor=colors.HexColor('#1E3A8A'),
-        spaceBefore=15,
-        spaceAfter=10,
+        spaceBefore=14,
+        spaceAfter=8,
         keepWithNext=True
     )
     
@@ -160,10 +261,10 @@ def generate_pdf_report(final_state: dict) -> bytes:
         'BodyTextCustom',
         parent=styles['Normal'],
         fontName='Helvetica',
-        fontSize=10,
-        leading=14,
-        textColor=colors.HexColor('#374151'),
-        spaceAfter=10
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor('#1F2937'),
+        spaceAfter=6
     )
     
     bold_body_style = ParagraphStyle(
@@ -172,92 +273,185 @@ def generate_pdf_report(final_state: dict) -> bytes:
         fontName='Helvetica-Bold'
     )
     
+    disclaimer_style = ParagraphStyle(
+        'DisclaimerText',
+        parent=styles['Normal'],
+        fontName='Helvetica-Oblique',
+        fontSize=8,
+        leading=11,
+        textColor=colors.HexColor('#6B7280'),
+        spaceBefore=12
+    )
+
     story = []
     
-    # Header Title
-    story.append(Paragraph("LegalValidate AI - Document Audit Report", title_style))
-    story.append(Paragraph("Automated Legal Validation, Risk Detection & Verification Trail", subtitle_style))
-    story.append(Spacer(1, 10))
+    # 1. Header
+    story.append(Paragraph("LegalValidate AI — Audit & Validation Report", title_style))
+    story.append(Paragraph("Automated Multi-Agent Legal Review, RAG Grounding & Verification Trail", subtitle_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#E5E7EB'), spaceBefore=0, spaceAfter=12))
     
-    # Metadata Box
+    # 2. Executive Metadata Box
     is_legal = final_state.get('is_legal', False)
-    status_text = "APPROVED LEGAL DOCUMENT" if is_legal else "NON-LEGAL / NEEDS MANUAL REVIEW"
-    status_color = '#10B981' if is_legal else '#EF4444'
+    status_text = "VALID LEGAL CONTRACT" if is_legal else "NON-LEGAL / FLAGGED DOCUMENT"
+    status_color = '#059669' if is_legal else '#DC2626'
+    doc_type = final_state.get('document_type', 'Contract / Document')
+    reason = final_state.get('classification_reason', 'Analysis completed.')
     
-    metadata_data = [
-        [Paragraph("<b>Document Type:</b>", body_style), Paragraph(final_state.get('document_type', 'Unknown'), body_style)],
-        [Paragraph("<b>Validation Status:</b>", body_style), Paragraph(f"<font color='{status_color}'><b>{status_text}</b></font>", body_style)],
-        [Paragraph("<b>Classification Reason:</b>", body_style), Paragraph(final_state.get('classification_reason', 'N/A'), body_style)]
+    # Count severities
+    risks = final_state.get('risks', []) or []
+    critic_reviews = final_state.get('critic_reviews', []) or []
+    critic_map = {r.get('risk_id', ''): r for r in critic_reviews if isinstance(r, dict)}
+    
+    crit_count = sum(1 for r in risks if isinstance(r, dict) and r.get('severity') == 'CRITICAL')
+    high_count = sum(1 for r in risks if isinstance(r, dict) and r.get('severity') == 'HIGH')
+    med_count = sum(1 for r in risks if isinstance(r, dict) and r.get('severity') == 'MEDIUM')
+    low_count = sum(1 for r in risks if isinstance(r, dict) and r.get('severity') == 'LOW')
+    
+    meta_table_data = [
+        [Paragraph("<b>Document Classification:</b>", body_style), Paragraph(doc_type, body_style),
+         Paragraph("<b>Validation Status:</b>", body_style), Paragraph(f"<font color='{status_color}'><b>{status_text}</b></font>", body_style)],
+        [Paragraph("<b>Identified Risks:</b>", body_style), Paragraph(f"Total: {len(risks)} | Critical: {crit_count} | High: {high_count} | Med: {med_count} | Low: {low_count}", body_style),
+         Paragraph("<b>Classifier Note:</b>", body_style), Paragraph(reason, body_style)]
     ]
     
-    t = Table(metadata_data, colWidths=[130, 370])
-    t.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F3F4F6')),
-        ('PADDING', (0,0), (-1,-1), 8),
-        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+    t_meta = Table(meta_table_data, colWidths=[120, 180, 100, 132])
+    t_meta.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F8FAFC')),
+        ('PADDING', (0,0), (-1,-1), 6),
         ('VALIGN', (0,0), (-1,-1), 'TOP'),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
-        ('LINEBELOW', (0,0), (-1,-2), 0.5, colors.HexColor('#E5E7EB')),
+        ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
+        ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
     ]))
-    story.append(t)
-    story.append(Spacer(1, 20))
-    
-    # Plain Language Summary & Explanation
-    story.append(Paragraph("Simplified Document Summary", h1_style))
-    story.append(Paragraph(final_state.get('summary', 'No summary generated.'), body_style))
+    story.append(t_meta)
     story.append(Spacer(1, 10))
     
-    story.append(Paragraph("Plain Language Explanation", h1_style))
-    story.append(Paragraph(final_state.get('simplified_explanation', 'No explanation generated.'), body_style))
-    story.append(Spacer(1, 20))
+    # 3. Document Analysis Summary
+    analysis = final_state.get('document_analysis', {}) or {}
+    if analysis:
+        story.append(Paragraph("Document Structure & Key Provisions", h1_style))
+        struct_data = []
+        if analysis.get('parties'):
+            struct_data.append([Paragraph("<b>Parties:</b>", body_style), Paragraph(", ".join(analysis['parties']), body_style)])
+        if analysis.get('effective_date'):
+            struct_data.append([Paragraph("<b>Effective Date:</b>", body_style), Paragraph(str(analysis['effective_date']), body_style)])
+        if analysis.get('term'):
+            struct_data.append([Paragraph("<b>Term / Duration:</b>", body_style), Paragraph(str(analysis['term']), body_style)])
+        if analysis.get('governing_law_and_jurisdiction'):
+            struct_data.append([Paragraph("<b>Governing Law:</b>", body_style), Paragraph(str(analysis['governing_law_and_jurisdiction']), body_style)])
+        if analysis.get('missing_sections'):
+            struct_data.append([Paragraph("<b>Missing Safeguards:</b>", body_style), Paragraph("<font color='#DC2626'>" + ", ".join(analysis['missing_sections']) + "</font>", body_style)])
+            
+        if struct_data:
+            t_struct = Table(struct_data, colWidths=[130, 402])
+            t_struct.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#FFFFFF')),
+                ('PADDING', (0,0), (-1,-1), 5),
+                ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                ('LINEBELOW', (0,0), (-1,-1), 0.5, colors.HexColor('#F1F5F9')),
+            ]))
+            story.append(t_struct)
+            story.append(Spacer(1, 8))
+
+    # 4. Plain-Language Executive Summary
+    summary = final_state.get('summary', '')
+    simplified = final_state.get('simplified_explanation', '')
+    if summary or simplified:
+        story.append(Paragraph("Executive Plain-Language Summary", h1_style))
+        if summary:
+            story.append(Paragraph(f"<b>Overview:</b> {summary}", body_style))
+        if simplified:
+            story.append(Paragraph(f"<b>Key Takeaways:</b> {simplified}", body_style))
+        story.append(Spacer(1, 8))
+        
+    # 5. Risk Assessment & Critic Verification Table
+    story.append(Paragraph("Risk Intelligence, RAG Grounding & Critic Audit", h1_style))
     
-    # Flagged Risks & Verdicts
-    story.append(Paragraph("Identified Risks & Critic Verification", h1_style))
-    risks = final_state.get('risks', [])
     if not risks:
-        story.append(Paragraph("No critical legal risks or non-compliance issues identified.", body_style))
+        story.append(Paragraph("No critical legal risks or non-compliance vulnerabilities were detected.", body_style))
     else:
-        critic_lookup = {r.get("risk", "").strip().lower(): r for r in final_state.get("critic_reviews", [])}
+        # Human decision lookup
+        human_decisions = {r.get('risk_id', ''): r for r in (final_state.get('human_reviews') or []) if isinstance(r, dict)}
         
-        # Table of risks
-        risk_table_data = [[
-            Paragraph("<b>Detected Risk</b>", bold_body_style),
-            Paragraph("<b>Critic Verdict</b>", bold_body_style),
-            Paragraph("<b>Verification Reason / Notes</b>", bold_body_style)
-        ]]
-        
-        for risk in risks:
-            review = critic_lookup.get(risk.strip().lower())
-            verdict = "N/A"
-            reason = "No verification performed."
-            verdict_color = '#374151'
+        for idx, risk in enumerate(risks, start=1):
+            if isinstance(risk, dict):
+                r_id = risk.get('risk_id', f"risk_{idx}")
+                clause = risk.get('clause', '')
+                r_type = risk.get('risk_type', 'Contractual Risk')
+                sev = risk.get('severity', 'MEDIUM')
+                exp = risk.get('explanation', '')
+                rec = risk.get('recommendation', '')
+                evidence = risk.get('evidence', []) or []
+                sources = risk.get('source_reference', []) or []
+            else:
+                r_id = f"risk_{idx}"
+                clause = str(risk)
+                r_type = "Identified Risk"
+                sev = "MEDIUM"
+                exp = str(risk)
+                rec = "Review terms with legal counsel."
+                evidence = []
+                sources = []
+
+            # Critic data
+            c_review = critic_map.get(r_id, {})
+            c_valid = c_review.get('is_valid', True)
+            c_sev = c_review.get('verified_severity', sev)
+            c_reason = c_review.get('reason', 'Audited by verification agent.')
             
-            if review:
-                verdict = review.get("verdict", "Unknown")
-                reason = review.get("reason", "")
-                if verdict == "Confirmed":
-                    verdict_color = '#DC2626' # Red
-                elif verdict == "Downgraded":
-                    verdict_color = '#D97706' # Orange
-                else:
-                    verdict_color = '#4B5563' # Grey
+            # Human Decision
+            h_review = human_decisions.get(r_id, {})
+            h_decision = h_review.get('decision', 'Pending Human Review')
+            h_note = h_review.get('note', '')
+
+            # Severity styling
+            sev_colors = {'CRITICAL': '#7F1D1D', 'HIGH': '#B91C1C', 'MEDIUM': '#B45309', 'LOW': '#1E3A8A'}
+            sev_c = sev_colors.get(c_sev, '#374151')
+
+            risk_card_data = [
+                [Paragraph(f"<b>#{idx}. {r_type}</b>", bold_body_style),
+                 Paragraph(f"<font color='{sev_c}'><b>Severity: {c_sev}</b></font> (Critic: {'Valid' if c_valid else 'Rejected'})", body_style)],
+                [Paragraph("<b>Target Clause:</b>", body_style), Paragraph(clause, body_style)],
+                [Paragraph("<b>Risk Analysis:</b>", body_style), Paragraph(exp, body_style)],
+                [Paragraph("<b>Recommendation:</b>", body_style), Paragraph(rec, body_style)],
+            ]
             
-            risk_table_data.append([
-                Paragraph(risk, body_style),
-                Paragraph(f"<font color='{verdict_color}'><b>{verdict}</b></font>", body_style),
-                Paragraph(reason, body_style)
+            if sources and sources[0] != "Insufficient retrieved evidence":
+                ref_text = "; ".join(sources[:2])
+                risk_card_data.append([Paragraph("<b>RAG Baseline Reference:</b>", body_style), Paragraph(ref_text, body_style)])
+                
+            risk_card_data.append([
+                Paragraph("<b>Critic Verdict / Reason:</b>", body_style),
+                Paragraph(f"<b>{c_sev}</b> — {c_reason}", body_style)
             ])
             
-        rt = Table(risk_table_data, colWidths=[150, 90, 260])
-        rt.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#E5E7EB')),
-            ('PADDING', (0,0), (-1,-1), 6),
-            ('VALIGN', (0,0), (-1,-1), 'TOP'),
-            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#D1D5DB')),
-        ]))
-        story.append(rt)
-        
-    # Build document
+            if h_decision != 'Pending Human Review' or h_note:
+                risk_card_data.append([
+                    Paragraph("<b>Human Reviewer Action:</b>", body_style),
+                    Paragraph(f"Decision: <b>{h_decision}</b>" + (f" | Notes: {h_note}" if h_note else ""), body_style)
+                ])
+
+            t_card = Table(risk_card_data, colWidths=[120, 412])
+            t_card.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#FFFFFF')),
+                ('PADDING', (0,0), (-1,-1), 5),
+                ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
+                ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor('#F1F5F9')),
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#F8FAFC')),
+            ]))
+            story.append(t_card)
+            story.append(Spacer(1, 8))
+
+    # 6. Legal Safety Disclaimer
+    story.append(Spacer(1, 10))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#CBD5E1'), spaceBefore=5, spaceAfter=8))
+    story.append(Paragraph(
+        "<b>LEGAL SAFETY DISCLAIMER:</b> LegalValidate AI is an automated machine-learning and analytical document validation assistant. "
+        "This report and any accompanying findings do NOT constitute formal legal advice, an attorney-client relationship, or a substitute for review by qualified legal counsel. "
+        "Users should always verify contract terms with authorized attorneys before executing binding agreements.",
+        disclaimer_style
+    ))
+    
     doc.build(story)
     pdf_bytes = buffer.getvalue()
     buffer.close()

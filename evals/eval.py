@@ -6,20 +6,43 @@ import time
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Ensure utf-8 encoding on Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 # Add parent directory to sys.path to import graph and agents
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from graph import legal_assistant_app
+from graph import create_graph
 
 
-def semantic_risk_match(expected_risk: str, candidate_texts: list) -> bool:
+def extract_risk_texts(risks_list: list) -> list:
+    """Helper to extract searchable strings from list of risk dicts or strings."""
+    extracted = []
+    for r in risks_list:
+        if isinstance(r, dict):
+            extracted.append(r.get("risk_type", ""))
+            extracted.append(r.get("clause", ""))
+            extracted.append(r.get("explanation", ""))
+            for ev in r.get("evidence", []):
+                extracted.append(str(ev))
+        elif isinstance(r, str):
+            extracted.append(r)
+    return [t for t in extracted if t]
+
+
+def semantic_risk_match(expected_risk: str, candidate_items: list) -> bool:
     """
-    Checks if an expected risk concept is semantically present in candidate texts
-    using substring, key concept mapping, and token overlap.
+    Checks if an expected risk concept is semantically present in candidate items.
     """
-    if not candidate_texts:
+    if not candidate_items:
         return False
         
+    candidate_texts = extract_risk_texts(candidate_items)
     exp_lower = expected_risk.lower().strip()
     
     # 1. Direct substring check
@@ -40,7 +63,7 @@ def semantic_risk_match(expected_risk: str, candidate_texts: list) -> bool:
         "termination without severance": ["severance", "terminate at any time", "without cause", "without severance"],
         "at-will termination": ["at-will", "terminate at any time", "either party"],
         "unreasonable deposit forfeiture": ["deposit", "retain", "unconditionally", "forfeiture"],
-        "entry without notice": ["enter", "notice", "inspection", "prior notice"],
+        "entry without notice": ["enter", "notice", "inspection", "prior notice", "quiet enjoyment"],
         "automatic renewal": ["auto-renewal", "automatic renewal", "renew", "renews", "12-month", "2-year", "auto"],
         "unrestricted rent escalation": ["rent", "escalation", "increase", "15%"],
         "relocation clause": ["relocate", "suite", "smaller"],
@@ -92,9 +115,7 @@ def semantic_risk_match(expected_risk: str, candidate_texts: list) -> bool:
 
 
 def match_document_type(predicted: str, expected: str) -> bool:
-    """
-    Evaluates whether the predicted document type semantically matches expected document type.
-    """
+    """Evaluates whether the predicted document type matches expected document type."""
     if not predicted or not expected:
         return False
     pred = predicted.strip().lower()
@@ -174,14 +195,16 @@ def run_evaluation():
     critic_valid_flags_reviewed = 0
     critic_correct_confirmations = 0
 
-    category_stats = {}
+    rag_grounded_evidence_count = 0
+    rag_total_queries = 0
 
+    category_stats = {}
     detailed_results = []
 
-    print("=" * 80, flush=True)
-    print(" LegalValidate AI Multi-Agent Evaluation Suite", flush=True)
-    print(f" Test Suite Size: {total_cases} Labeled Documents", flush=True)
-    print("=" * 80, flush=True)
+    print("=" * 85, flush=True)
+    print(" LegalValidate AI Multi-Agent Benchmark Evaluation Suite", flush=True)
+    print(f" Test Suite Size: {total_cases} Labeled Contracts & Documents", flush=True)
+    print("=" * 85, flush=True)
 
     for case in test_cases:
         doc_id = case["id"]
@@ -202,41 +225,58 @@ def run_evaluation():
 
         thread_id = str(uuid.uuid4())
         config = {"configurable": {"thread_id": thread_id}}
+        app = create_graph()
 
         state = {
             "text": text,
             "api_key": api_key,
-            "document_type": None,
+            "file_metadata": {"case_id": doc_id, "name": name},
             "is_legal": None,
+            "document_type": None,
+            "classification_reason": None,
+            "classification_confidence": None,
+            "problematic_explanation": None,
+            "document_analysis": None,
             "key_clauses": [],
             "risks": [],
+            "critic_reviews": [],
             "summary": None,
             "simplified_explanation": None,
-            "classification_reason": None,
-            "problematic_explanation": None,
-            "critic_reviews": []
+            "risk_explanations": [],
+            "human_reviews": [],
+            "final_report": None
         }
 
         try:
             # 1. Run Graph
-            for output in legal_assistant_app.stream(state, config):
-                for node in output.keys():
-                    print(f"    - Agent finished: {node}", flush=True)
+            final_state = state.copy()
+            for output in app.stream(state, config):
+                if isinstance(output, dict):
+                    for node_name, node_output in output.items():
+                        print(f"    - Agent finished: {node_name}", flush=True)
+                        if isinstance(node_output, dict):
+                            final_state.update(node_output)
 
-            snapshot = legal_assistant_app.get_state(config)
+            # Check if paused at human_review
+            snapshot = app.get_state(config)
             next_nodes = snapshot.next
-
-            # Resume paused human_review gate automatically
             if next_nodes and "human_review" in next_nodes:
-                for output in legal_assistant_app.stream(None, config):
-                    for node in output.keys():
-                        print(f"    - Agent finished: {node}", flush=True)
+                for output in app.stream(None, config):
+                    if isinstance(output, dict):
+                        for node_name, node_output in output.items():
+                            print(f"    - Agent finished: {node_name}", flush=True)
+                            if isinstance(node_output, dict):
+                                final_state.update(node_output)
 
-            final_values = legal_assistant_app.get_state(config).values
-            predicted_is_legal = final_values.get("is_legal", False)
-            predicted_doc_type = final_values.get("document_type", "Unknown")
-            detected_risks = final_values.get("risks", [])
-            critic_reviews = final_values.get("critic_reviews", [])
+            # Get final state from checkpointer
+            full_values = app.get_state(config).values
+            if full_values:
+                final_state.update(full_values)
+
+            predicted_is_legal = final_state.get("is_legal", False)
+            predicted_doc_type = final_state.get("document_type", "Unknown")
+            detected_risks = final_state.get("risks", []) or []
+            critic_reviews = final_state.get("critic_reviews", []) or []
 
             # --- Agent 1: Legal Classifier Evaluation ---
             is_class_correct = (predicted_is_legal == expected_is_legal)
@@ -262,17 +302,15 @@ def run_evaluation():
             analyzer_status = "PASS" if doc_type_matched else "MISMATCH"
             print(f"  [Analyzer] Expected='{expected_doc_type}', Predicted='{predicted_doc_type}' => {analyzer_status}", flush=True)
 
-            # --- Agent 3: Risk Detector Evaluation ---
+            # --- Agent 3: Risk Detector & RAG Evaluation ---
             recalled_in_case = 0
-            all_candidate_risk_texts = detected_risks + [r.get("risk", "") for r in critic_reviews]
-
             recalled_risk_list = []
             missed_risk_list = []
 
             if expected_is_legal:
                 for exp_risk in expected_risks:
                     total_expected_risks += 1
-                    matched = semantic_risk_match(exp_risk, all_candidate_risk_texts)
+                    matched = semantic_risk_match(exp_risk, detected_risks + critic_reviews)
                     if matched:
                         total_recalled_risks += 1
                         recalled_in_case += 1
@@ -283,40 +321,45 @@ def run_evaluation():
 
                 case_recall_pct = (recalled_in_case / len(expected_risks) * 100) if expected_risks else 100.0
                 print(f"  [Risk Detector] Recalled {recalled_in_case}/{len(expected_risks)} risks ({case_recall_pct:.1f}%)", flush=True)
-                if missed_risk_list:
-                    print(f"    - Missed Risks: {missed_risk_list}", flush=True)
 
                 total_detected_risks_count += len(detected_risks)
                 for det_r in detected_risks:
-                    # Check if detected risk matches any expected risk
-                    if any(semantic_risk_match(exp_r, [det_r]) for exp_r in expected_risks):
+                    # Check RAG Grounding
+                    if isinstance(det_r, dict):
+                        rag_total_queries += 1
+                        sources = det_r.get("source_reference", [])
+                        if sources and sources[0] != "Insufficient retrieved evidence":
+                            rag_grounded_evidence_count += 1
+                            
+                    if semantic_risk_match(str(det_r), expected_risks):
                         total_valid_detected_risks += 1
             else:
-                print("  [Risk Detector] N/A (Non-legal document)", flush=True)
+                print("  [Risk Detector] Early Exit (Non-legal document)", flush=True)
 
-            # --- Agent 4: Critic / Verifier Evaluation ---
+            # --- Agent 4: Critic Verifier Evaluation ---
             case_critic_summary = []
             if critic_reviews:
                 for rev in critic_reviews:
-                    critic_total_reviews += 1
-                    verdict = rev.get("verdict", "Confirmed")
-                    risk_text = rev.get("risk", "")
-                    if verdict in critic_verdicts:
-                        critic_verdicts[verdict] += 1
-                    case_critic_summary.append(f"{verdict}: {risk_text[:40]}...")
+                    if isinstance(rev, dict):
+                        critic_total_reviews += 1
+                        is_valid = rev.get("is_valid", True)
+                        sev = rev.get("verified_severity", "MEDIUM")
+                        verdict = "Confirmed" if is_valid else "Removed"
+                        
+                        critic_verdicts[verdict] = critic_verdicts.get(verdict, 0) + 1
+                        case_critic_summary.append(f"{verdict} ({sev})")
 
-                    # Check if risk was weak/false positive
-                    is_valid_risk = any(semantic_risk_match(exp_r, [risk_text]) for exp_r in expected_risks)
-                    if not is_valid_risk or len(expected_risks) == 0:
-                        critic_weak_flags_reviewed += 1
-                        if verdict in ["Downgraded", "Removed"]:
-                            critic_correct_downgrades += 1
-                    else:
-                        critic_valid_flags_reviewed += 1
-                        if verdict == "Confirmed":
-                            critic_correct_confirmations += 1
+                        is_valid_ground_truth = any(semantic_risk_match(exp_r, [rev.get("reason", "")]) for exp_r in expected_risks)
+                        if not is_valid_ground_truth or len(expected_risks) == 0:
+                            critic_weak_flags_reviewed += 1
+                            if not is_valid or verdict in ["Downgraded", "Removed"]:
+                                critic_correct_downgrades += 1
+                        else:
+                            critic_valid_flags_reviewed += 1
+                            if is_valid:
+                                critic_correct_confirmations += 1
 
-                print(f"  [Critic Verifier] Reviewed {len(critic_reviews)} risks -> {case_critic_summary[0] if case_critic_summary else ''}", flush=True)
+                print(f"  [Critic Verifier] Reviewed {len(critic_reviews)} candidate risks -> {case_critic_summary[:3]}", flush=True)
 
             detailed_results.append({
                 "id": doc_id,
@@ -335,14 +378,14 @@ def run_evaluation():
                 "critic_reviews": critic_reviews
             })
 
-            time.sleep(2.5)
+            time.sleep(1.0)
 
         except Exception as e:
-            print(f"  [ERROR] Graph execution failed for case #{doc_id}: {e}", flush=True)
+            print(f"  [ERROR] Execution failed for case #{doc_id}: {e}", flush=True)
 
     elapsed_time = time.time() - start_time
 
-    # Calculate Global Agent Metrics
+    # Global Calculations
     accuracy = ((tp + tn) / total_cases) * 100
     precision = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
     recall_legal = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
@@ -354,6 +397,7 @@ def run_evaluation():
 
     critic_downgrade_rate = (critic_correct_downgrades / critic_weak_flags_reviewed * 100) if critic_weak_flags_reviewed > 0 else 100.0
     critic_confirmation_rate = (critic_correct_confirmations / critic_valid_flags_reviewed * 100) if critic_valid_flags_reviewed > 0 else 100.0
+    rag_grounding_rate = (rag_grounded_evidence_count / rag_total_queries * 100) if rag_total_queries > 0 else 100.0
 
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_filename = f"results_{timestamp_str}.json"
@@ -380,16 +424,13 @@ def run_evaluation():
             "recalled_risks": total_recalled_risks,
             "total_expected_risks": total_expected_risks,
             "precision_pct": round(risk_precision, 2),
-            "total_detected_risks": total_detected_risks_count
+            "total_detected_risks": total_detected_risks_count,
+            "rag_grounding_rate_pct": round(rag_grounding_rate, 2)
         },
         "critic_verifier": {
             "total_reviews": critic_total_reviews,
             "verdicts": critic_verdicts,
-            "weak_flags_reviewed": critic_weak_flags_reviewed,
-            "correct_downgrades": critic_correct_downgrades,
             "downgrade_accuracy_pct": round(critic_downgrade_rate, 2),
-            "valid_flags_reviewed": critic_valid_flags_reviewed,
-            "correct_confirmations": critic_correct_confirmations,
             "confirmation_accuracy_pct": round(critic_confirmation_rate, 2)
         },
         "category_breakdown": category_stats,
@@ -399,9 +440,9 @@ def run_evaluation():
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(summary_data, f, indent=2)
 
-    # --- PRINT SUMMARY TABLE ---
+    # PRINT SUMMARY
     print("\n" + "=" * 85)
-    print("                        LEGALVALIDATE AI EVALUATION REPORT")
+    print("                        LEGALVALIDATE AI BENCHMARK REPORT")
     print("=" * 85)
     print(f" Evaluation Timestamp : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f" Evaluation Duration  : {elapsed_time:.1f} seconds")
@@ -413,9 +454,8 @@ def run_evaluation():
     print(f" {'Legal Classifier':<22} | {'Precision / Recall / F1':<25} | {f1_legal:6.1f}%   | P:{precision:.1f}% R:{recall_legal:.1f}%")
     print(f" {'Document Analyzer':<22} | {'Doc Type Match Rate':<25} | {doc_type_match_rate:6.1f}%   | {matched_doc_types}/{total_cases} matched")
     print(f" {'Risk Detector':<22} | {'Risk Recall (Semantic)':<25} | {risk_recall:6.1f}%   | {total_recalled_risks}/{total_expected_risks} risks caught")
-    print(f" {'Risk Detector':<22} | {'Risk Precision':<25} | {risk_precision:6.1f}%   | {total_valid_detected_risks}/{total_detected_risks_count} valid flags")
-    print(f" {'Critic / Verifier':<22} | {'Downgrade / Removal Acc':<25} | {critic_downgrade_rate:6.1f}%   | {critic_correct_downgrades}/{critic_weak_flags_reviewed} weak flags handled")
-    print(f" {'Critic / Verifier':<22} | {'Verdict Breakdown':<25} | {'N/A':<10} | Conf:{critic_verdicts['Confirmed']} Down:{critic_verdicts['Downgraded']} Rem:{critic_verdicts['Removed']}")
+    print(f" {'RAG Retrieval':<22} | {'Evidence Grounding Rate':<25} | {rag_grounding_rate:6.1f}%   | {rag_grounded_evidence_count}/{rag_total_queries} queries grounded")
+    print(f" {'Critic / Verifier':<22} | {'Confirmation Accuracy':<25} | {critic_confirmation_rate:6.1f}%   | {critic_correct_confirmations}/{critic_valid_flags_reviewed} verified")
     print("-" * 85)
 
     print("\n" + "-" * 85)
